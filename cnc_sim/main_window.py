@@ -5,6 +5,7 @@ from __future__ import annotations
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction, QColor, QKeySequence, QTextCharFormat, QTextCursor, QTextFormat
 from PyQt6.QtWidgets import (
+    QApplication,
     QComboBox,
     QDoubleSpinBox,
     QHBoxLayout,
@@ -26,6 +27,7 @@ from .canvas import LatheCanvas
 from .examples import EXAMPLES
 from .parser import FanucParser
 from .simulation import SimulationEngine
+from .styles import DARK_STYLESHEET, LIGHT_STYLESHEET
 
 
 class MainWindow(QMainWindow):
@@ -33,6 +35,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("CNC Lathe Simulator — FANUC Training")
         self.resize(1440, 850)
+        self.theme = "dark"
         self.parser = FanucParser()
         self.engine = SimulationEngine()
         self.engine.line_changed.connect(self._highlight_line)
@@ -87,6 +90,9 @@ class MainWindow(QMainWindow):
         speed.valueChanged.connect(self.engine.set_speed)
         controls.addWidget(speed)
         controls.addStretch(1)
+        self.theme_button = QPushButton("☀ Light Mode")
+        self.theme_button.clicked.connect(self._toggle_theme)
+        controls.addWidget(self.theme_button)
         self.readout = QLabel("X --  Z --  F --  S --")
         self.readout.setObjectName("statusReadout")
         controls.addWidget(self.readout)
@@ -98,20 +104,27 @@ class MainWindow(QMainWindow):
         self.editor.setMinimumWidth(340)
         splitter.addWidget(self.editor)
 
-        center = QWidget()
-        center_layout = QVBoxLayout(center)
-        center_layout.setContentsMargins(0, 0, 0, 0)
-        view_controls = QHBoxLayout()
-        machine_button = QPushButton("Machine View")
-        drawing_button = QPushButton("Drawing View")
-        machine_button.clicked.connect(lambda: self.canvas.set_mode("machine"))
-        drawing_button.clicked.connect(lambda: self.canvas.set_mode("drawing"))
-        view_controls.addWidget(machine_button)
-        view_controls.addWidget(drawing_button)
-        view_controls.addStretch(1)
-        center_layout.addLayout(view_controls)
-        self.canvas = LatheCanvas(self.engine)
-        center_layout.addWidget(self.canvas, 1)
+        center = QSplitter(Qt.Orientation.Vertical)
+
+        machine_pane = QWidget()
+        machine_layout = QVBoxLayout(machine_pane)
+        machine_layout.setContentsMargins(0, 0, 0, 4)
+        machine_layout.addWidget(QLabel("Machine View"))
+        self.machine_canvas = LatheCanvas(self.engine)
+        self.machine_canvas.set_mode("machine")
+        machine_layout.addWidget(self.machine_canvas, 1)
+        center.addWidget(machine_pane)
+
+        drawing_pane = QWidget()
+        drawing_layout = QVBoxLayout(drawing_pane)
+        drawing_layout.setContentsMargins(0, 4, 0, 0)
+        drawing_layout.addWidget(QLabel("Drawing View"))
+        self.drawing_canvas = LatheCanvas(self.engine)
+        self.drawing_canvas.set_mode("drawing")
+        drawing_layout.addWidget(self.drawing_canvas, 1)
+        center.addWidget(drawing_pane)
+
+        center.setSizes([1, 1])
         splitter.addWidget(center)
 
         self.tabs = QTabWidget()
@@ -138,6 +151,17 @@ class MainWindow(QMainWindow):
         parse_action.setShortcut(QKeySequence("F5"))
         parse_action.triggered.connect(self.parse_program)
         self.addAction(parse_action)
+
+    def _toggle_theme(self) -> None:
+        self.theme = "light" if self.theme == "dark" else "dark"
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(LIGHT_STYLESHEET if self.theme == "light" else DARK_STYLESHEET)
+        self.machine_canvas.set_theme(self.theme)
+        self.drawing_canvas.set_theme(self.theme)
+        self.theme_button.setText("🌙 Dark Mode" if self.theme == "light" else "☀ Light Mode")
+        if self.engine.current_motion:
+            self._highlight_line(self.engine.current_motion.line_index)
 
     def _load_example(self, name: str) -> None:
         if name not in EXAMPLES:
@@ -196,7 +220,7 @@ class MainWindow(QMainWindow):
         selection = QTextEdit.ExtraSelection()
         selection.cursor = cursor
         selection.format = QTextCharFormat()
-        selection.format.setBackground(QColor("#214a61"))
+        selection.format.setBackground(QColor("#bfe0f5") if self.theme == "light" else QColor("#214a61"))
         selection.format.setProperty(QTextFormat.Property.FullWidthSelection, True)
         self.editor.setExtraSelections([selection])
         self.editor.setTextCursor(cursor)

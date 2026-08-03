@@ -26,6 +26,7 @@ class SimulationEngine(QObject):
         self.tool_x = 60.0
         self.tool_z = 5.0
         self.stock_profile: list[float] = []
+        self.final_profile: list[float] = []
         self.profile_step = 0.5
 
     @property
@@ -44,6 +45,9 @@ class SimulationEngine(QObject):
         self.tool_z = first.start_z if first else 5
         count = max(2, int(program.stock_length / self.profile_step) + 1)
         self.stock_profile = [program.stock_diameter] * count
+        self.final_profile = [program.stock_diameter] * count
+        for finished_motion in program.motions:
+            self._apply_cut_to(self.final_profile, finished_motion, 0.0, 1.0)
         self.changed.emit()
         if first:
             self.line_changed.emit(first.line_index)
@@ -100,7 +104,12 @@ class SimulationEngine(QObject):
             self.line_changed.emit(motion.line_index)
 
     def _apply_cut(self, motion: Motion, p0: float, p1: float) -> None:
-        if not motion.is_cutting or not self.program:
+        if not self.program:
+            return
+        self._apply_cut_to(self.stock_profile, motion, p0, p1)
+
+    def _apply_cut_to(self, profile: list[float], motion: Motion, p0: float, p1: float) -> None:
+        if not motion.is_cutting:
             return
         span = max(abs(motion.end_z - motion.start_z), abs(motion.end_x - motion.start_x), 0.5)
         samples = max(2, int(span / self.profile_step) + 2)
@@ -109,10 +118,10 @@ class SimulationEngine(QObject):
             z = motion.start_z + (motion.end_z - motion.start_z) * p
             x = motion.start_x + (motion.end_x - motion.start_x) * p
             index = int(round(-z / self.profile_step))
-            if 0 <= index < len(self.stock_profile):
-                self.stock_profile[index] = min(self.stock_profile[index], max(0.0, x))
+            if 0 <= index < len(profile):
+                profile[index] = min(profile[index], max(0.0, x))
                 if motion.kind in (MotionKind.CUT, MotionKind.THREAD):
                     for neighbor in (-1, 1):
                         ni = index + neighbor
-                        if 0 <= ni < len(self.stock_profile):
-                            self.stock_profile[ni] = min(self.stock_profile[ni], max(0.0, x + 0.2))
+                        if 0 <= ni < len(profile):
+                            profile[ni] = min(profile[ni], max(0.0, x + 0.2))
