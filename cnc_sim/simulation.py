@@ -44,7 +44,13 @@ class SimulationEngine(QObject):
         self.live_stock = Stock(st.diameter, st.length, st.face_z, st.step)
         self.final_stock = Stock(st.diameter, st.length, st.face_z, st.step)
         for s in program.segs:
-            self.final_stock.carve(s.z0, s.r0, s.z1, s.r1)
+            if not s.rapid:
+                if s.internal:
+                    self.final_stock.bore(s.z0, s.r0, s.z1, s.r1, s.tool_radius)
+                elif s.face_width > 0.0:
+                    self.final_stock.carve_face(s.z1, min(s.r0, s.r1), s.face_width)
+                else:
+                    self.final_stock.carve(s.z0, s.r0, s.z1, s.r1)
 
         self.seg_i, self.seg_t = 0, 0.0
         self.current_seg = None
@@ -99,8 +105,13 @@ class SimulationEngine(QObject):
 
             az, ar = at(t0)
             bz, br = at(t1)
-            if stock is not None:
-                stock.carve(az, ar, bz, br)
+            if stock is not None and not s.rapid:
+                if s.internal:
+                    stock.bore(az, ar, bz, br, s.tool_radius)
+                elif s.face_width > 0.0:
+                    stock.carve_face(s.z1, min(ar, br), s.face_width)
+                else:
+                    stock.carve(az, ar, bz, br)
 
             self.tool_z, self.tool_x = bz, br * 2.0
             self.cur_g, self.feed, self.current_seg = s.g, s.feed, s

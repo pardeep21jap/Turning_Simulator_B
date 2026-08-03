@@ -2,13 +2,26 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QAction, QColor, QKeySequence, QTextCharFormat, QTextCursor, QTextFormat
+from PyQt6.QtCore import QPointF, QRegularExpression, Qt
+from PyQt6.QtGui import (
+    QAction,
+    QColor,
+    QKeySequence,
+    QPainter,
+    QPixmap,
+    QRegularExpressionValidator,
+    QTextCharFormat,
+    QTextCursor,
+    QTextFormat,
+)
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
     QDoubleSpinBox,
+    QDialog,
+    QDialogButtonBox,
     QFrame,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -24,7 +37,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from .canvas import LatheCanvas
+from .canvas import DEFAULT_TOOL_ASSIGNMENTS, LatheCanvas
 from .examples import EXAMPLES
 from .lathe_core import spindle_rpm
 from .models import Program
@@ -45,6 +58,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("CNC Lathe Simulator — FANUC Training")
         self.resize(1440, 850)
         self.theme = "dark"
+        self.tool_assignments = dict(DEFAULT_TOOL_ASSIGNMENTS)
         self._cycle_selections: list[QTextEdit.ExtraSelection] = []
         self._current_line_selection: QTextEdit.ExtraSelection | None = None
         self.parser = FanucParser()
@@ -94,6 +108,10 @@ class MainWindow(QMainWindow):
         step_button = QPushButton("Single Block")
         step_button.clicked.connect(self.engine.single_block)
         controls.addWidget(step_button)
+        tool_setup_button = QPushButton("Tool Setup")
+        tool_setup_button.setToolTip("Assign tool stations to machining operations")
+        tool_setup_button.clicked.connect(self._show_tool_setup)
+        controls.addWidget(tool_setup_button)
         controls.addWidget(QLabel("Speed"))
         speed = QDoubleSpinBox()
         speed.setRange(0.1, 10.0)
@@ -162,6 +180,83 @@ class MainWindow(QMainWindow):
         parse_action.setShortcut(QKeySequence("F5"))
         parse_action.triggered.connect(self.parse_program)
         self.addAction(parse_action)
+
+    def _show_tool_setup(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Tool Setup")
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("Select a preset or type a custom tool number from T01 to T99."))
+        form = QFormLayout()
+        choices: dict[str, QComboBox] = {}
+        previews: dict[str, QLabel] = {}
+        labels = (
+            ("turning", "Turning / Facing"),
+            ("roughing", "Roughing / Face Cycle"),
+            ("boring", "Boring"),
+            ("drilling", "Drilling"),
+        )
+        stations = [f"T{station:02d}" for station in range(1, 13)]
+        tool_validator = QRegularExpressionValidator(QRegularExpression(r"T(?:0[1-9]|[1-9][0-9])"))
+        for operation, label in labels:
+            combo = QComboBox()
+            combo.addItems(stations)
+            combo.setEditable(True)
+            combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+            combo.lineEdit().setValidator(tool_validator)
+            combo.lineEdit().setPlaceholderText("T01–T99")
+            combo.setCurrentText(f"T{self.tool_assignments[operation]:02d}")
+            preview = QLabel()
+            preview.setFixedSize(155, 100)
+            preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            selector_row = QWidget()
+            selector_layout = QHBoxLayout(selector_row)
+            selector_layout.setContentsMargins(0, 0, 0, 0)
+            selector_layout.addWidget(combo)
+            selector_layout.addWidget(preview)
+            form.addRow(label, selector_row)
+            choices[operation] = combo
+            previews[operation] = preview
+            combo.currentTextChanged.connect(
+                lambda tool, op=operation: self._update_tool_preview(previews[op], op, tool)
+            )
+            self._update_tool_preview(preview, operation, combo.currentText())
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        if any(not combo.lineEdit().hasAcceptableInput() for combo in choices.values()):
+            QMessageBox.warning(self, "Tool Setup", "Enter each custom tool number in T01–T99 format.")
+            return
+        selected = {
+            operation: int(combo.currentText()[1:])
+            for operation, combo in choices.items()
+        }
+        if len(set(selected.values())) != len(selected):
+            QMessageBox.warning(self, "Tool Setup", "Each operation must use a different tool station.")
+            return
+        self.tool_assignments = selected
+        self.machine_canvas.set_tool_assignments(selected)
+        self.drawing_canvas.set_tool_assignments(selected)
+        summary = ", ".join(f"{label}: T{selected[key]:02d}" for key, label in labels)
+        self.statusBar().showMessage(f"Tool setup updated — {summary}", 8000)
+
+    def _update_tool_preview(self, label: QLabel, operation: str, tool: str) -> None:
+        pixmap = QPixmap(label.size())
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        style = {"boring": "boring", "drilling": "drill"}.get(operation, "turning")
+        tip = QPointF(12, 94) if style == "turning" else QPointF(12, 52)
+        self.machine_canvas._draw_tool_icon(painter, self.machine_canvas._colors(), tip, style)
+        painter.end()
+        label.setPixmap(pixmap)
+        label.setToolTip(f"{tool or 'Custom tool'} — {operation.replace('_', ' ').title()}")
 
     def _build_dro_row(self) -> QWidget:
         row = QFrame()
@@ -248,7 +343,9 @@ class MainWindow(QMainWindow):
         cuts = [s for s in program.segs if not s.rapid]
         if not cuts:
             return self.stock_diameter.value(), self.stock_length.value()
-        max_diameter = max(s.r1 * 2.0 for s in cuts)
+        # Facing cuts often begin at the stock OD and end at a much smaller
+        # radius, so both ends of every cutting segment must be considered.
+        max_diameter = max(max(s.r0, s.r1) * 2.0 for s in cuts)
         min_z = min(s.z1 for s in cuts)
         diameter = min(300.0, max(5.0, max_diameter + 2.0))
         length = min(500.0, max(10.0, abs(min_z) + 5.0))

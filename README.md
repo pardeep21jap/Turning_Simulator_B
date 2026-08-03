@@ -7,7 +7,7 @@ A VS Code-ready educational 2D CNC lathe simulator for FANUC-style programs.
 - Editable G-code with active-block and cycle-block highlighting
 - Animated tool motion over a real per-column stock removal model
 - G00/G01/G02/G03 motion, G28 home, G90/G91, F/S words, G96/G97 CSS-to-RPM conversion
-- Real multi-pass roughing simulation for G71/G73, plus G70 finishing and G74 peck cycles
+- Real multi-pass roughing simulation for G71/G72/G73, plus G70 finishing and G74 peck cycles
 - Per-tool-station icons (turning/drill/boring/grooving) and a DRO readout row
 - Facing, turning, grooving and threading sample programs
 - Dimensioned drawing view generated from the finished contour
@@ -61,13 +61,12 @@ The compiler (`cnc_sim/lathe_core.py`) accepts common FANUC-style words such as
 programming is assumed for X; arcs may use `R` or `I`/`K`. Parenthesized and
 semicolon comments are supported.
 
-G71/G73 are expanded into real multi-pass roughing followed by a G70 finishing
+G71/G72/G73 are expanded into real multi-pass roughing followed by a G70 finishing
 pass. G74 expands into a peck cycle. G28 approximates a return-to-reference
-rapid. **G72 (face-first roughing) and G76 (threading) are not specially
+rapid. **G76 (threading) is not specially
 expanded** — a program using them will still compile, but those cycles run as
 plain sequential motion rather than a proper multi-pass simulation. There is
-also no `U`/`W` incremental-axis shorthand outside of cycle parameters; use
-`G91` for incremental positioning instead. Controller-specific parameters and
+`U`/`W` incremental-axis shorthand is supported for contour moves. Controller-specific parameters and
 every FANUC option are not implemented.
 
 ## Project layout

@@ -44,6 +44,16 @@ def parse_words(raw: str) -> dict:
     return out
 
 
+def tool_station(value: float | str) -> int:
+    """Return the turret station from Tnn or FANUC Tnnoo notation."""
+    number = int(round(float(value)))
+    return number // 100 if number >= 100 else number
+
+
+def format_tool(value: float | str) -> str:
+    return f"T{tool_station(value):02d}"
+
+
 # --------------------------------------------------------------------------
 # geometry
 # --------------------------------------------------------------------------
@@ -116,6 +126,7 @@ class Stock:
     def reset(self) -> None:
         r = self.radius
         self.rad = array("f", [0.0]) * self.n
+        self.inner = array("f", [0.0]) * self.n
         self.cut = bytearray(self.n)
         left = self.face_z - self.length
         for i in range(self.n):
@@ -141,8 +152,35 @@ class Stock:
             t = (self.z_at(i) - z0) / dz
             self._column(i, r0 + (r1 - r0) * min(1.0, max(0.0, t)))
 
+    def carve_face(self, z: float, radius: float, width: float) -> None:
+        """Remove one axial layer swept by a radial facing cut."""
+        a = self.idx(min(z, z + width))
+        b = self.idx(max(z, z + width))
+        for i in range(max(0, a), min(self.n - 1, b) + 1):
+            self._column(i, radius)
+
+    def _bore_column(self, i: int, radius: float) -> None:
+        if 0 <= i < self.n and self.rad[i] > 0.0:
+            radius = min(max(0.0, radius), self.rad[i])
+            if radius > self.inner[i]:
+                self.inner[i] = radius
+                self.cut[i] = 1
+
+    def bore(self, z0, r0, z1, r1, tool_radius=0.0) -> None:
+        """Sweep an internal drill/boring tool without changing the OD."""
+        if abs(z1 - z0) < self.step:
+            self._bore_column(self.idx(z1), max(r0, r1, tool_radius))
+            return
+        a, b = self.idx(min(z0, z1)), self.idx(max(z0, z1))
+        dz = z1 - z0
+        for i in range(max(0, a), min(self.n - 1, b) + 1):
+            t = min(1.0, max(0.0, (self.z_at(i) - z0) / dz))
+            self._bore_column(i, max(r0 + (r1 - r0) * t, tool_radius))
+
     def removed_fraction(self) -> float:
-        return max(0.0, 1.0 - sum(v * v for v in self.rad) / self._area0)
+        area = sum(max(0.0, outer * outer - inner * inner)
+                   for outer, inner in zip(self.rad, self.inner))
+        return max(0.0, 1.0 - area / self._area0)
 
     def profile(self):
         """[(z, radius), ...] for every column that still has material."""
@@ -167,6 +205,9 @@ class Seg:
     clamp: float = 4000.0
     sval: float = 0.0
     arc_radius: float = 0.0   # 0 for lines; |R| for arc chords, used for drawing dimensions
+    face_width: float = 0.0   # axial layer cleared by a G72 radial facing pass
+    internal: bool = False    # drill/boring cut changes the bore, not the OD
+    tool_radius: float = 0.0  # physical radius used by a centerline drill
 
     @property
     def length(self) -> float:
@@ -224,7 +265,10 @@ class Compiler:
         self.sval = 0.0
         self.cyc_u = 2.0      # G71 depth of cut (radius)
         self.cyc_r = 0.5      # G71 retract
+        self.cyc_w = 2.0      # G72 depth of cut (Z axis)
         self.cyc_g74_r = 0.5  # G74 retract between pecks
+        self.tool_radii: dict[str, float] = {}
+        self.pending_drill_radius = 0.0
 
     # -- helpers ----------------------------------------------------------
     def say(self, kind, line, text):
@@ -232,8 +276,11 @@ class Compiler:
             self.msgs.append(Message(kind, line, text))
 
     def seg(self, z0, r0, z1, r1, rapid, line, g, feed, arc_radius=0.0) -> Seg:
+        station = tool_station(self.tool[1:])
+        internal = station in (3, 4, 6)
         return Seg(z0, r0, z1, r1, rapid, line, g, feed,
-                   self.tool, self.css, self.clamp, self.sval, arc_radius)
+                   self.tool, self.css, self.clamp, self.sval, arc_radius,
+                   internal=internal, tool_radius=self.tool_radii.get(self.tool, 0.0))
 
     def move(self, words, g, tz, tr, feed, line):
         """Emit one motion, splitting arcs into chords."""
@@ -272,11 +319,11 @@ class Compiler:
             for g in w["G"]:
                 if g <= 3:
                     self.g = g
-            tz = (w["Z"] if self.absolute else self.z + w["Z"]) if "Z" in w else self.z
-            tx = (w["X"] if self.absolute else self.x + w["X"]) if "X" in w else self.x
+            tz = (w["Z"] if self.absolute else self.z + w["Z"]) if "Z" in w else self.z + w.get("W", 0.0)
+            tx = (w["X"] if self.absolute else self.x + w["X"]) if "X" in w else self.x + w.get("U", 0.0)
             if "F" in w:
                 self.f = w["F"]
-            if "X" in w or "Z" in w:
+            if any(axis in w for axis in ("X", "Z", "U", "W")):
                 self.move(w, self.g, tz, tx / 2.0,
                           self.f if feed_override is None else feed_override, k)
         if sink is not None:
@@ -416,6 +463,88 @@ class Compiler:
         self.say("ok", line,
                  f"{cycle_name} expanded - {passes} roughing passes, {self.cyc_u:.2f} mm depth")
 
+    def face_rough(self, p_block, q_block, u, w_off, feed, line):
+        """Expand a G72 face-roughing cycle into radial cuts at stepped Z depths."""
+        z_save, x_save = self.z, self.x
+        profile: list[Seg] = []
+        self.run_range(p_block, q_block, feed, sink=profile)
+        self.z, self.x = z_save, x_save
+        if not profile:
+            self.say("err", line, "G72 profile is empty")
+            return
+
+        start_z, start_r = profile[0].z1, profile[0].r1
+        body = profile[1:]
+        if not self.part_profile and body:
+            self.part_profile = list(body)
+        contour = profile
+        z_lo = min(min(s.z0, s.z1) for s in contour)
+        z_hi = max(max(s.z0, s.z1) for s in contour)
+
+        def radius_at(z):
+            candidates = []
+            for s in contour:
+                low, high = sorted((s.z0, s.z1))
+                if low - 1e-9 <= z <= high + 1e-9:
+                    if abs(s.z1 - s.z0) < 1e-9:
+                        candidates.extend((s.r0, s.r1))
+                    else:
+                        t = (z - s.z0) / (s.z1 - s.z0)
+                        candidates.append(s.r0 + (s.r1 - s.r0) * t)
+            return min(candidates) if candidates else start_r
+
+        depth = max(0.05, abs(self.cyc_w))
+        retract = max(0.05, abs(self.cyc_r))
+        # G72 returns to the programmed cycle start diameter (X176 here),
+        # matching the straight clearance line shown in FANUC cycle diagrams.
+        outer_r = max(x_save / 2.0, start_r)
+        z_cut = z_hi - depth
+        passes = 0
+        while z_cut > z_lo + 1e-9 and passes < 400:
+            target_r = radius_at(z_cut) + u / 2.0
+            self.out.append(self.seg(self.z, self.x / 2.0, z_cut, outer_r, True, line, 0, 0.0))
+            self.z, self.x = z_cut, outer_r * 2.0
+            self.move({}, 1, z_cut, target_r, feed, line)
+            self.out[-1].face_width = min(depth, z_hi - z_cut)
+            # The 45-degree G72 pull-out is a clearance move, not another
+            # cutting stroke. Keep it in the path but never carve stock.
+            self.out.append(self.seg(self.z, self.x / 2.0, z_cut + retract,
+                                     target_r + retract, True, line, 0, 0.0))
+            self.z, self.x = z_cut + retract, (target_r + retract) * 2.0
+            # Return in X at the retracted Z, then the next loop iteration
+            # shifts along Z at the clearance diameter. This avoids a false
+            # diagonal fan between facing passes.
+            self.out.append(self.seg(self.z, self.x / 2.0, self.z,
+                                     outer_r, True, line, 0, 0.0))
+            self.x = outer_r * 2.0
+            z_cut -= depth
+            passes += 1
+
+        if z_cut <= z_lo + 1e-9:
+            target_r = radius_at(z_lo) + u / 2.0
+            self.out.append(self.seg(self.z, self.x / 2.0, z_lo, outer_r, True, line, 0, 0.0))
+            self.z, self.x = z_lo, outer_r * 2.0
+            self.move({}, 1, z_lo, target_r, feed, line)
+            self.out[-1].face_width = min(depth, z_hi - z_lo)
+            self.out.append(self.seg(self.z, self.x / 2.0, z_lo + retract,
+                                     target_r + retract, True, line, 0, 0.0))
+            self.z, self.x = z_lo + retract, (target_r + retract) * 2.0
+            self.out.append(self.seg(self.z, self.x / 2.0, self.z,
+                                     outer_r, True, line, 0, 0.0))
+            self.x = outer_r * 2.0
+            passes += 1
+
+        # Semi-finish along the programmed contour with cycle allowances.
+        self.out.append(self.seg(self.z, self.x / 2.0, start_z + w_off,
+                                 start_r + u / 2.0, True, line, 0, 0.0))
+        self.z, self.x = start_z + w_off, (start_r + u / 2.0) * 2.0
+        for s in body:
+            self.move({}, 1, s.z1 + w_off, s.r1 + u / 2.0, feed, line)
+        self.out.append(self.seg(self.z, self.x / 2.0, z_save, x_save / 2.0,
+                                 True, line, 0, 0.0))
+        self.z, self.x = z_save, x_save
+        self.say("ok", line, f"G72 expanded - {passes} facing passes, {depth:.2f} mm depth")
+
     # -- main pass --------------------------------------------------------
     def compile(self) -> CompileResult:
         pc, guard, ended = 0, 0, False
@@ -423,6 +552,12 @@ class Compiler:
             guard += 1
             i, w = self.blocks[pc]
             gs = w["G"]
+
+            raw_upper = self.lines[i].upper()
+            if "DRILL" in raw_upper:
+                diameter = re.search(r"(?:Ø|DIA(?:METER)?)[^0-9]*([0-9]+(?:\.[0-9]+)?)", raw_upper)
+                if diameter:
+                    self.pending_drill_radius = float(diameter.group(1)) / 2.0
 
             if 90 in gs:
                 self.absolute = True
@@ -435,8 +570,13 @@ class Compiler:
             if 92 in gs and "S" in w:
                 self.clamp = w["S"]
             if "T" in w:
-                self.tool = "T%02d" % int(round(w["T"]))
-            if "S" in w and 92 not in gs and 96 not in gs:
+                self.tool = format_tool(w["T"])
+                if self.pending_drill_radius > 0.0:
+                    self.tool_radii[self.tool] = self.pending_drill_radius
+                    self.pending_drill_radius = 0.0
+            if 50 in gs and "S" in w:
+                self.clamp = w["S"]
+            elif "S" in w and 92 not in gs and 96 not in gs:
                 self.sval = w["S"]
             if "F" in w:
                 self.f = w["F"]
@@ -470,6 +610,26 @@ class Compiler:
                 pc += 1
                 continue
 
+            # ---- G72 face roughing --------------------------------------
+            if 72 in gs:
+                if "P" in w and "Q" in w:
+                    pb = self.by_n.get(int(w["P"]))
+                    qb = self.by_n.get(int(w["Q"]))
+                    if pb is None or qb is None or qb < pb:
+                        self.say("err", i,
+                                 f"G72 P{int(w['P'])} Q{int(w['Q'])} - cannot find those block numbers")
+                    else:
+                        self.cycle_lines.update(range(pb, qb + 1))
+                        self.face_rough(pb, qb, w.get("U", 0.0), w.get("W", 0.0),
+                                        w.get("F", self.f), i)
+                        pc = max(pc + 1, qb + 1)
+                        continue
+                else:
+                    self.cyc_w = w.get("W", self.cyc_w)
+                    self.cyc_r = w.get("R", self.cyc_r)
+                pc += 1
+                continue
+
             # ---- G74 -----------------------------------------------------
             if 74 in gs:
                 if "R" in w and "Z" not in w and "X" not in w:
@@ -496,9 +656,9 @@ class Compiler:
             for g in gs:
                 if g <= 3:
                     self.g = g
-            tz = (w["Z"] if self.absolute else self.z + w["Z"]) if "Z" in w else self.z
-            tx = (w["X"] if self.absolute else self.x + w["X"]) if "X" in w else self.x
-            if "X" in w or "Z" in w:
+            tz = (w["Z"] if self.absolute else self.z + w["Z"]) if "Z" in w else self.z + w.get("W", 0.0)
+            tx = (w["X"] if self.absolute else self.x + w["X"]) if "X" in w else self.x + w.get("U", 0.0)
+            if any(axis in w for axis in ("X", "Z", "U", "W")):
                 self.move(w, self.g, tz, tx / 2.0, self.f, i)
 
             if 30 in w["M"] or 2 in w["M"]:

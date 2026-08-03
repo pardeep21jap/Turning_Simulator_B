@@ -10,7 +10,26 @@ from .dimensioning import ChamferDim, DiameterDim, LengthDim, RadiusDim, extract
 from .lathe_core import Stock
 from .simulation import SimulationEngine
 
-TOOL_STYLES: dict[int, str] = {3: "drill", 4: "boring", 5: "grooving"}
+DEFAULT_TOOL_STYLE = "turning"
+DEFAULT_TOOL_ASSIGNMENTS: dict[str, int] = {
+    "turning": 1,
+    "roughing": 2,
+    "boring": 3,
+    "drilling": 4,
+}
+
+
+def tool_styles(assignments: dict[str, int]) -> dict[int, str]:
+    """Convert operation-to-station choices into renderer styles."""
+    styles = {
+        assignments["turning"]: "turning",
+        assignments["roughing"]: "turning",
+        assignments["boring"]: "boring",
+        assignments["drilling"]: "drill",
+    }
+    if 5 not in assignments.values():
+        styles[5] = "grooving"
+    return styles
 
 
 def _tool_station(tool: str) -> int:
@@ -33,6 +52,19 @@ THEMES: dict[str, dict[str, QColor]] = {
         "tool_dark": QColor("#8f2020"),
         "tool_body_light": QColor("#aab8c4"),
         "tool_body_dark": QColor("#4c5966"),
+        "insert_light": QColor("#f2e07a"),
+        "insert_dark": QColor("#a68f2c"),
+        "general_tool_outline": QColor("#77818a"),
+        "boring_bar_light": QColor("#3a3d40"),
+        "boring_bar_dark": QColor("#050505"),
+        "boring_pocket_light": QColor("#d9b23c"),
+        "boring_pocket_dark": QColor("#7a5a12"),
+        "boring_screw": QColor("#9aa2a8"),
+        "drill_shank_light": QColor("#e4e8eb"),
+        "drill_shank_dark": QColor("#737b81"),
+        "drill_flute_light": QColor("#555d62"),
+        "drill_flute_dark": QColor("#101315"),
+        "drill_land": QColor("#c5cbd0"),
         "readout_text": QColor("#dbe8f5"),
         "part_light": QColor("#c3d3de"),
         "part_dark": QColor("#5c707f"),
@@ -60,6 +92,19 @@ THEMES: dict[str, dict[str, QColor]] = {
         "tool_dark": QColor("#941f1f"),
         "tool_body_light": QColor("#c7d0d8"),
         "tool_body_dark": QColor("#8a97a3"),
+        "insert_light": QColor("#f0d968"),
+        "insert_dark": QColor("#8f7a1f"),
+        "general_tool_outline": QColor("#777777"),
+        "boring_bar_light": QColor("#3a3d40"),
+        "boring_bar_dark": QColor("#050505"),
+        "boring_pocket_light": QColor("#d9b23c"),
+        "boring_pocket_dark": QColor("#7a5a12"),
+        "boring_screw": QColor("#8a97a3"),
+        "drill_shank_light": QColor("#e4e8eb"),
+        "drill_shank_dark": QColor("#737b81"),
+        "drill_flute_light": QColor("#555d62"),
+        "drill_flute_dark": QColor("#101315"),
+        "drill_land": QColor("#c5cbd0"),
         "readout_text": QColor("#1f2933"),
         "part_light": QColor("#f4f7fa"),
         "part_dark": QColor("#9fb0bd"),
@@ -81,6 +126,7 @@ class LatheCanvas(QWidget):
         self.engine = engine
         self.mode = "machine"
         self.theme = "dark"
+        self.tool_assignments = dict(DEFAULT_TOOL_ASSIGNMENTS)
         self.setMinimumSize(500, 360)
         self.engine.changed.connect(self.update)
 
@@ -90,6 +136,10 @@ class LatheCanvas(QWidget):
 
     def set_theme(self, theme: str) -> None:
         self.theme = theme
+        self.update()
+
+    def set_tool_assignments(self, assignments: dict[str, int]) -> None:
+        self.tool_assignments = dict(assignments)
         self.update()
 
     def _colors(self) -> dict[str, QColor]:
@@ -156,13 +206,19 @@ class LatheCanvas(QWidget):
 
     def _segment_path(self, stock: Stock, start: int, end: int, stride: int) -> QPainterPath:
         path = QPainterPath()
+        path.setFillRule(Qt.FillRule.OddEvenFill)
         points_top: list[QPointF] = []
         points_bottom: list[QPointF] = []
+        bore_top: list[QPointF] = []
+        bore_bottom: list[QPointF] = []
         for i in range(start, end + 1, stride):
             z = stock.z_at(i)
             r = stock.rad[i]
             points_top.append(self._transform(z, r))
             points_bottom.append(self._transform(z, -r))
+            inner = stock.inner[i]
+            bore_top.append(self._transform(z, inner))
+            bore_bottom.append(self._transform(z, -inner))
         if not points_top:
             return path
         path.moveTo(points_top[0])
@@ -171,6 +227,13 @@ class LatheCanvas(QWidget):
         for point in reversed(points_bottom):
             path.lineTo(point)
         path.closeSubpath()
+        if any(stock.inner[i] > 0.0 for i in range(start, end + 1, stride)):
+            path.moveTo(bore_top[0])
+            for point in bore_top[1:]:
+                path.lineTo(point)
+            for point in reversed(bore_bottom):
+                path.lineTo(point)
+            path.closeSubpath()
         return path
 
     def _profile_runs(self, stock: Stock, stride: int) -> list[tuple[int, int, bool]]:
@@ -237,7 +300,8 @@ class LatheCanvas(QWidget):
         # Tool is shown above the stock; X is diameter programmed.
         tip = self._transform(self.engine.tool_z, self.engine.tool_x / 2.0)
         station = _tool_station(self._active_tool())
-        self._draw_tool_icon(painter, colors, tip, TOOL_STYLES.get(station, "turning"))
+        style = tool_styles(self.tool_assignments).get(station, DEFAULT_TOOL_STYLE)
+        self._draw_tool_icon(painter, colors, tip, style)
         painter.setPen(colors["readout_text"])
         painter.setFont(QFont("Consolas", 9))
         painter.drawText(16, 24, f"X {self.engine.tool_x:8.3f}   Z {self.engine.tool_z:8.3f}")
@@ -263,17 +327,116 @@ class LatheCanvas(QWidget):
         painter.setPen(QPen(colors["tool_outline"], 1.6))
 
         if style == "drill":
-            shank = QRectF(tip.x() - 6, tip.y() - 34, 12, 26)
-            painter.setBrush(body)
-            painter.drawRect(shank)
-            painter.setBrush(insert)
-            painter.drawPolygon(QPolygonF([tip, tip + QPointF(-6, -8), tip + QPointF(6, -8)]))
+            # Horizontal twist drill. The point at the left is the programmed
+            # position and the shank extends away from the workpiece.
+            shank = QRectF(tip.x() + 78, tip.y() - 9, 54, 18)
+            shank_fill = self._cylinder_gradient(
+                shank, colors["drill_shank_light"], colors["drill_shank_dark"]
+            )
+            painter.setPen(QPen(colors["general_tool_outline"], 1.0))
+            painter.setBrush(shank_fill)
+            painter.drawRoundedRect(shank, 5, 5)
+
+            drill_body = QPainterPath()
+            drill_body.moveTo(tip)
+            drill_body.lineTo(tip + QPointF(5, -9))
+            drill_body.cubicTo(
+                tip + QPointF(19, -10), tip + QPointF(22, -7), tip + QPointF(31, -8)
+            )
+            drill_body.cubicTo(
+                tip + QPointF(45, -10), tip + QPointF(59, -9), tip + QPointF(79, -9)
+            )
+            drill_body.lineTo(tip + QPointF(79, 9))
+            drill_body.cubicTo(
+                tip + QPointF(62, 9), tip + QPointF(48, 10), tip + QPointF(34, 8)
+            )
+            drill_body.cubicTo(
+                tip + QPointF(23, 7), tip + QPointF(18, 10), tip + QPointF(5, 9)
+            )
+            drill_body.closeSubpath()
+            flute_fill = self._cylinder_gradient(
+                drill_body.boundingRect(), colors["drill_flute_light"], colors["drill_flute_dark"]
+            )
+            painter.setBrush(flute_fill)
+            painter.drawPath(drill_body)
+
+            # Bright helical lands clipped inside the drill silhouette.
+            painter.save()
+            painter.setClipPath(drill_body)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(colors["drill_land"], 4.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            helix = QPainterPath(tip + QPointF(1, -2))
+            helix.cubicTo(
+                tip + QPointF(14, -10), tip + QPointF(19, 10), tip + QPointF(35, 5)
+            )
+            helix.cubicTo(
+                tip + QPointF(48, 0), tip + QPointF(53, -8), tip + QPointF(67, -3)
+            )
+            helix.cubicTo(
+                tip + QPointF(72, -1), tip + QPointF(76, 1), tip + QPointF(81, 1)
+            )
+            painter.drawPath(helix)
+            second_helix = QPainterPath(tip + QPointF(9, 9))
+            second_helix.cubicTo(
+                tip + QPointF(19, 1), tip + QPointF(25, -9), tip + QPointF(39, -4)
+            )
+            second_helix.cubicTo(
+                tip + QPointF(52, 1), tip + QPointF(58, 9), tip + QPointF(73, 5)
+            )
+            painter.drawPath(second_helix)
+            painter.restore()
+            return
         elif style == "boring":
-            bar = QRectF(tip.x(), tip.y() - 5, 34, 10)
-            painter.setBrush(body)
-            painter.drawRect(bar)
-            painter.setBrush(insert)
-            painter.drawPolygon(QPolygonF([tip, tip + QPointF(8, -7), tip + QPointF(14, 0), tip + QPointF(8, 7)]))
+            # The insert's lower-left corner is the programmed cutting point;
+            # the complete bar sits above and to its right, as in the photo.
+            bar = QRectF(tip.x() + 29, tip.y() - 17, 115, 14)
+            bar_fill = self._cylinder_gradient(bar, colors["boring_bar_light"], colors["boring_bar_dark"])
+            painter.setPen(QPen(colors["general_tool_outline"], 1.0))
+            painter.setBrush(bar_fill)
+            painter.drawRoundedRect(bar, 5, 5)
+
+            # Wide black head with a swept lower edge into the round shaft.
+            head = QPolygonF(
+                [
+                    tip + QPointF(5, -17),
+                    tip + QPointF(32, -17),
+                    tip + QPointF(32, -7),
+                    tip + QPointF(27, -4),
+                    tip + QPointF(22, 1),
+                    tip + QPointF(16, 3),
+                    tip + QPointF(1, 2),
+                ]
+            )
+            painter.drawPolygon(head)
+
+            # Collar line between the two shaft sections.
+            painter.setPen(QPen(colors["general_tool_outline"], 0.8))
+            painter.drawLine(QPointF(tip.x() + 58, tip.y() - 17), QPointF(tip.x() + 58, tip.y() - 3))
+
+            # Large tilted square carbide insert from the close-up reference.
+            boring_insert = QPolygonF(
+                [
+                    tip,
+                    tip + QPointF(5, -15),
+                    tip + QPointF(21, -15),
+                    tip + QPointF(17, 1),
+                ]
+            )
+            insert_fill = self._cylinder_gradient(
+                boring_insert.boundingRect(), colors["boring_pocket_light"], colors["boring_pocket_dark"]
+            )
+            painter.setPen(QPen(colors["general_tool_outline"], 1.0))
+            painter.setBrush(insert_fill)
+            painter.drawPolygon(boring_insert)
+
+            screw = tip + QPointF(11, -7)
+            painter.setPen(QPen(colors["general_tool_outline"], 0.8))
+            painter.setBrush(colors["boring_bar_dark"])
+            painter.drawEllipse(screw, 4.2, 4.2)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(colors["boring_screw"])
+            painter.drawEllipse(screw, 1.3, 1.3)
+            return
         elif style == "grooving":
             blade = QRectF(tip.x() - 4, tip.y() - 30, 8, 24)
             painter.setBrush(body)
@@ -281,10 +444,41 @@ class LatheCanvas(QWidget):
             painter.setBrush(insert)
             painter.drawRect(QRectF(tip.x() - 5, tip.y() - 6, 10, 6))
         else:
-            tool_rect = QRectF(tip.x(), tip.y() - 32, 32, 32)
-            painter.setPen(QPen(colors["tool_outline"], 2))
-            painter.setBrush(self._cylinder_gradient(tool_rect, colors["tool_light"], colors["tool_dark"]))
-            painter.drawPolygon(QPolygonF([tip, tip + QPointF(22, -10), tip + QPointF(32, -32), tip + QPointF(8, -24)]))
+            # General OD tool, traced from the supplied reference: the shank
+            # and angled lower holder are one continuous silhouette.
+            holder = QPolygonF(
+                [
+                    tip + QPointF(9, -90),
+                    tip + QPointF(27, -90),
+                    tip + QPointF(27, -8),
+                    tip,
+                    tip + QPointF(9, -27),
+                ]
+            )
+            holder_bounds = holder.boundingRect()
+            holder_fill = self._cylinder_gradient(
+                holder_bounds, colors["tool_body_light"], colors["tool_body_dark"]
+            )
+            painter.setPen(QPen(colors["general_tool_outline"], 1.2))
+            painter.setBrush(holder_fill)
+            painter.drawPolygon(holder)
+
+            # The insert overlays the sloping holder face and shares the
+            # reference's narrow, skewed diamond proportions.
+            insert_shape = QPolygonF(
+                [
+                    tip,
+                    tip + QPointF(7, -17),
+                    tip + QPointF(20, -21),
+                    tip + QPointF(15, -6),
+                ]
+            )
+            insert_fill = self._cylinder_gradient(
+                insert_shape.boundingRect(), colors["insert_light"], colors["insert_dark"]
+            )
+            painter.setPen(QPen(colors["general_tool_outline"], 1.2))
+            painter.setBrush(insert_fill)
+            painter.drawPolygon(insert_shape)
             return
 
         painter.setBrush(colors["tool_light"])
