@@ -1,5 +1,5 @@
-"""Derives technical-drawing dimensions (diameters, lengths, radii, chamfers)
-from the finished contour of a parsed program.
+"""Derives technical-drawing dimensions (diameters, lengths, radii) from the
+finished contour lathe_core already computed for a compiled program.
 """
 
 from __future__ import annotations
@@ -7,10 +7,10 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from .models import Motion, MotionKind, Program
+from .models import Program
 
+RADIUS_TOLERANCE = 0.025
 DIAMETER_TOLERANCE = 0.05
-CHAMFER_ANGLE_TOLERANCE = 6.0
 
 
 @dataclass(slots=True)
@@ -53,66 +53,31 @@ class DimensionSet:
     chamfers: list[ChamferDim]
 
 
-def _finish_contour(program: Program) -> list[Motion]:
-    cycles = {m.cycle for m in program.motions if m.cycle}
-    if "G70" in cycles:
-        wanted = {"G70"}
-    elif cycles & {"G71", "G72"}:
-        wanted = {"G71", "G72"}
-    else:
-        wanted = {None}
-    return [m for m in program.motions if m.cycle in wanted and m.kind != MotionKind.RAPID]
-
-
 def extract_dimensions(program: Program) -> DimensionSet:
     diameters: list[DiameterDim] = []
     lengths: list[LengthDim] = []
     radii: list[RadiusDim] = []
-    chamfers: list[ChamferDim] = []
 
-    for motion in _finish_contour(program):
-        dz = motion.end_z - motion.start_z
-        dx = motion.end_x - motion.start_x
-
-        if motion.kind in (MotionKind.ARC_CW, MotionKind.ARC_CCW):
-            if motion.arc_radius:
-                radii.append(
-                    RadiusDim(
-                        z=(motion.start_z + motion.end_z) / 2.0,
-                        x_radius=(motion.start_x + motion.end_x) / 4.0,
-                        radius=motion.arc_radius,
-                    )
-                )
+    for feature in program.features:
+        if feature.kind == "arc":
+            radii.append(RadiusDim(z=feature.mid_z, x_radius=feature.mid_r, radius=feature.radius))
             continue
-
-        if abs(dz) < 1e-6:
+        if abs(feature.z1 - feature.z0) < 1e-6:
             continue
-
-        if abs(dx) < DIAMETER_TOLERANCE * 2:
-            diameter = round((motion.start_x + motion.end_x) / 2.0, 3)
-            diameters.append(DiameterDim(motion.start_z, motion.end_z, diameter))
-            lengths.append(LengthDim(motion.start_z, motion.end_z))
-            continue
-
-        angle = math.degrees(math.atan2(abs(dx) / 2.0, abs(dz)))
-        if abs(angle - 45.0) <= CHAMFER_ANGLE_TOLERANCE:
-            leg = min(abs(dz), abs(dx) / 2.0)
-            chamfers.append(
-                ChamferDim(
-                    z=(motion.start_z + motion.end_z) / 2.0,
-                    x_radius=max(motion.start_x, motion.end_x) / 2.0,
-                    leg=leg,
-                    angle=45.0,
-                )
-            )
+        if abs(feature.r1 - feature.r0) < RADIUS_TOLERANCE:
+            diameter = round(feature.r0 + feature.r1, 3)
+            diameters.append(DiameterDim(feature.z0, feature.z1, diameter))
+            lengths.append(LengthDim(feature.z0, feature.z1))
 
     deduped: list[DiameterDim] = []
     for dim in diameters:
-        if deduped and abs(deduped[-1].diameter - dim.diameter) < DIAMETER_TOLERANCE and math.isclose(
-            deduped[-1].z_end, dim.z_start, abs_tol=1e-3
+        if (
+            deduped
+            and abs(deduped[-1].diameter - dim.diameter) < DIAMETER_TOLERANCE
+            and math.isclose(deduped[-1].z_end, dim.z_start, abs_tol=1e-3)
         ):
             deduped[-1] = DiameterDim(deduped[-1].z_start, dim.z_end, deduped[-1].diameter)
         else:
             deduped.append(dim)
 
-    return DimensionSet(deduped, lengths, radii, chamfers)
+    return DimensionSet(deduped, lengths, radii, [])

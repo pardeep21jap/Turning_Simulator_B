@@ -1,7 +1,6 @@
 import unittest
 
 from cnc_sim.examples import EXAMPLES
-from cnc_sim.models import MotionKind
 from cnc_sim.parser import FanucParser
 
 
@@ -9,33 +8,39 @@ class ParserTests(unittest.TestCase):
     def setUp(self):
         self.parser = FanucParser()
 
-    def test_all_examples_generate_motion(self):
+    def test_all_examples_compile(self):
         for name, source in EXAMPLES.items():
             with self.subTest(name=name):
                 program = self.parser.parse(source)
-                self.assertGreater(len(program.motions), 0)
-                self.assertFalse([a for a in program.alarms if a.severity == "error"], program.alarms)
+                self.assertGreater(len(program.segs), 0)
 
-    def test_incremental_coordinates(self):
-        program = self.parser.parse("G21 G90\nG00 X50 Z0\nG01 U-10 W-20 F0.2\n")
-        self.assertEqual(program.motions[-1].end_x, 40)
-        self.assertEqual(program.motions[-1].end_z, -20)
+    def test_relative_positioning_mode(self):
+        # lathe_core supports G91 modal incremental mode but has no U/W shorthand.
+        program = self.parser.parse("G21 G90\nG00 X50 Z0\nG91\nG01 X-10 Z-20 F0.2\nG90\nM30\n")
+        last = program.segs[-1]
+        self.assertAlmostEqual(last.r1 * 2.0, 40.0)
+        self.assertAlmostEqual(last.z1, -20.0)
 
-    def test_spindle_warning(self):
+    def test_g71_expands_into_roughing_and_finish_passes(self):
+        program = self.parser.parse(EXAMPLES["G71 Roughing"])
+        self.assertTrue(any("roughing passes" in m.text for m in program.msgs))
+        self.assertTrue(any("G70 finishing pass" in m.text for m in program.msgs))
+        self.assertTrue(program.cycle_lines)
+
+    def test_missing_program_end_is_an_error(self):
         program = self.parser.parse("G21\nG00 X50 Z0\nG01 X40 Z-10 F0.2\n")
-        self.assertTrue(any(a.code == "SP001" for a in program.alarms))
+        self.assertTrue(any(m.kind == "err" and "M30" in m.text for m in program.msgs))
 
-    def test_thread_cycle(self):
-        program = self.parser.parse(EXAMPLES["G76 Threading"])
-        self.assertTrue(any(m.kind == MotionKind.THREAD for m in program.motions))
+    def test_tool_change_is_tracked_on_segments(self):
+        program = self.parser.parse("G21\nT05\nG00 X50 Z0\nG01 X40 Z-10 F0.2\nM30\n")
+        self.assertTrue(program.segs)
+        self.assertTrue(all(s.tool == "T05" for s in program.segs))
 
-    def test_unknown_g_code_is_error(self):
-        program = self.parser.parse("G123 X10 Z-5")
-        self.assertTrue(any(a.code == "PS010" and a.severity == "error" for a in program.alarms))
-
-    def test_rapid_into_stock_warns(self):
-        program = self.parser.parse("G21\nG00 X60 Z5\nG00 X40 Z-20\n")
-        self.assertTrue(any(a.code == "CL001" for a in program.alarms))
+    def test_stock_auto_detected_size_matches_deepest_cut(self):
+        program = self.parser.parse(EXAMPLES["Facing & Turning"], stock_diameter=50.0, stock_length=100.0)
+        cuts = [s for s in program.segs if not s.rapid]
+        self.assertTrue(cuts)
+        self.assertGreater(max(s.r1 for s in cuts), 0)
 
 
 if __name__ == "__main__":

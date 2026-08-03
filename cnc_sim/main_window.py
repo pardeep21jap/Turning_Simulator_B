@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
     QDoubleSpinBox,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -25,9 +26,17 @@ from PyQt6.QtWidgets import (
 
 from .canvas import LatheCanvas
 from .examples import EXAMPLES
+from .lathe_core import spindle_rpm
+from .models import Program
 from .parser import FanucParser
 from .simulation import SimulationEngine
 from .styles import DARK_STYLESHEET, LIGHT_STYLESHEET
+
+GCODE_LABELS = {0: "G00", 1: "G01", 2: "G02", 3: "G03"}
+
+
+def _mode_label(g: int) -> str:
+    return GCODE_LABELS.get(g, f"G{g:02d}")
 
 
 class MainWindow(QMainWindow):
@@ -36,6 +45,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("CNC Lathe Simulator — FANUC Training")
         self.resize(1440, 850)
         self.theme = "dark"
+        self._cycle_selections: list[QTextEdit.ExtraSelection] = []
+        self._current_line_selection: QTextEdit.ExtraSelection | None = None
         self.parser = FanucParser()
         self.engine = SimulationEngine()
         self.engine.line_changed.connect(self._highlight_line)
@@ -60,12 +71,14 @@ class MainWindow(QMainWindow):
         self.stock_diameter.setRange(5.0, 300.0)
         self.stock_diameter.setValue(50.0)
         self.stock_diameter.setSuffix(" mm")
+        self.stock_diameter.setToolTip("Auto-detected from the program on each parse")
         controls.addWidget(self.stock_diameter)
         controls.addWidget(QLabel("Length"))
         self.stock_length = QDoubleSpinBox()
         self.stock_length.setRange(10.0, 500.0)
         self.stock_length.setValue(100.0)
         self.stock_length.setSuffix(" mm")
+        self.stock_length.setToolTip("Auto-detected from the program on each parse")
         controls.addWidget(self.stock_length)
         parse_button = QPushButton("Parse / Reset")
         parse_button.clicked.connect(self.parse_program)
@@ -93,10 +106,8 @@ class MainWindow(QMainWindow):
         self.theme_button = QPushButton("☀ Light Mode")
         self.theme_button.clicked.connect(self._toggle_theme)
         controls.addWidget(self.theme_button)
-        self.readout = QLabel("X --  Z --  F --  S --")
-        self.readout.setObjectName("statusReadout")
-        controls.addWidget(self.readout)
         root_layout.addLayout(controls)
+        root_layout.addWidget(self._build_dro_row())
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         self.editor = QPlainTextEdit()
@@ -152,6 +163,35 @@ class MainWindow(QMainWindow):
         parse_action.triggered.connect(self.parse_program)
         self.addAction(parse_action)
 
+    def _build_dro_row(self) -> QWidget:
+        row = QFrame()
+        row.setObjectName("droRow")
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(10, 4, 10, 4)
+        layout.setSpacing(22)
+        self.dro: dict[str, QLabel] = {}
+        for key, caption in (
+            ("X", "X Ø"),
+            ("Z", "Z"),
+            ("F", "FEED mm/rev"),
+            ("S", "SPINDLE"),
+            ("G", "MODE"),
+            ("T", "TOOL"),
+            ("R", "REMOVED"),
+        ):
+            cell = QVBoxLayout()
+            cell.setSpacing(0)
+            caption_label = QLabel(caption)
+            caption_label.setObjectName("droCaption")
+            value_label = QLabel("--")
+            value_label.setObjectName("droValue")
+            cell.addWidget(caption_label)
+            cell.addWidget(value_label)
+            layout.addLayout(cell)
+            self.dro[key] = value_label
+        layout.addStretch(1)
+        return row
+
     def _toggle_theme(self) -> None:
         self.theme = "light" if self.theme == "dark" else "dark"
         app = QApplication.instance()
@@ -160,8 +200,12 @@ class MainWindow(QMainWindow):
         self.machine_canvas.set_theme(self.theme)
         self.drawing_canvas.set_theme(self.theme)
         self.theme_button.setText("🌙 Dark Mode" if self.theme == "light" else "☀ Light Mode")
-        if self.engine.current_motion:
-            self._highlight_line(self.engine.current_motion.line_index)
+        if self.engine.program:
+            self._cycle_selections = self._build_cycle_selections(self.engine.program)
+        if self.engine.current_seg:
+            self._highlight_line(self.engine.current_seg.line)
+        else:
+            self._apply_selections()
 
     def _load_example(self, name: str) -> None:
         if name not in EXAMPLES:
@@ -175,44 +219,80 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Program edited — select Parse / Reset before running")
 
     def parse_program(self) -> None:
-        program = self.parser.parse(
-            self.editor.toPlainText(),
+        text = self.editor.toPlainText()
+        draft = self.parser.parse(
+            text,
             stock_diameter=self.stock_diameter.value(),
             stock_length=self.stock_length.value(),
         )
+        diameter, length = self._detect_stock(draft)
+        self.stock_diameter.setValue(diameter)
+        self.stock_length.setValue(length)
+        program = self.parser.parse(text, stock_diameter=diameter, stock_length=length)
         self.engine.load(program)
+        self._cycle_selections = self._build_cycle_selections(program)
+        self._apply_selections()
         self._populate_motion_table()
         self._populate_alarm_table()
-        errors = sum(a.severity == "error" for a in program.alarms)
-        warnings = len(program.alarms) - errors
-        self.statusBar().showMessage(f"Parsed {len(program.blocks)} blocks, {len(program.motions)} motions, {errors} errors, {warnings} warnings")
+        errors = sum(m.kind == "err" for m in program.msgs)
+        notes = len(program.msgs) - errors
+        self.statusBar().showMessage(
+            f"Compiled {len(program.lines)} lines, {len(program.segs)} segments, {errors} errors, {notes} notes"
+        )
         self.editor.document().setModified(False)
         if errors:
             self.tabs.setCurrentWidget(self.alarm_table)
 
+    def _detect_stock(self, program: Program) -> tuple[float, float]:
+        """Estimate a snug stock size from the widest/deepest cutting segment."""
+        cuts = [s for s in program.segs if not s.rapid]
+        if not cuts:
+            return self.stock_diameter.value(), self.stock_length.value()
+        max_diameter = max(s.r1 * 2.0 for s in cuts)
+        min_z = min(s.z1 for s in cuts)
+        diameter = min(300.0, max(5.0, max_diameter + 2.0))
+        length = min(500.0, max(10.0, abs(min_z) + 5.0))
+        return diameter, length
+
     def _populate_motion_table(self) -> None:
-        motions = self.engine.program.motions if self.engine.program else []
-        self.motion_table.setRowCount(len(motions))
-        for row, motion in enumerate(motions):
-            values = [str(motion.line_index + 1), motion.kind.value, f"{motion.end_x:.3f}", f"{motion.end_z:.3f}", motion.cycle or ""]
+        program = self.engine.program
+        segs = program.segs if program else []
+        self.motion_table.setRowCount(len(segs))
+        for row, seg in enumerate(segs):
+            cycle = "cycle" if program and seg.line in program.cycle_lines else ""
+            values = [str(seg.line + 1), _mode_label(seg.g), f"{seg.r1 * 2.0:.3f}", f"{seg.z1:.3f}", cycle]
             for column, value in enumerate(values):
                 self.motion_table.setItem(row, column, QTableWidgetItem(value))
         self.motion_table.resizeColumnsToContents()
 
     def _populate_alarm_table(self) -> None:
-        alarms = self.engine.program.alarms if self.engine.program else []
-        self.alarm_table.setRowCount(len(alarms))
-        for row, alarm in enumerate(alarms):
-            values = [str(alarm.line_index + 1), alarm.code, alarm.message]
+        msgs = self.engine.program.msgs if self.engine.program else []
+        self.alarm_table.setRowCount(len(msgs))
+        for row, msg in enumerate(msgs):
+            values = [str(msg.line + 1), msg.kind.upper(), msg.text]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                if alarm.severity == "error":
-                    item.setForeground(QColor("#ff7777"))
-                else:
-                    item.setForeground(QColor("#ffc866"))
-                item.setData(Qt.ItemDataRole.UserRole, alarm.line_index)
+                item.setForeground(QColor("#ff7777") if msg.kind == "err" else QColor("#8ee6b8"))
+                item.setData(Qt.ItemDataRole.UserRole, msg.line)
                 self.alarm_table.setItem(row, column, item)
         self.alarm_table.resizeColumnsToContents()
+
+    def _build_cycle_selections(self, program: Program) -> list[QTextEdit.ExtraSelection]:
+        color = QColor("#0e7490") if self.theme == "light" else QColor("#49c9dd")
+        selections = []
+        for line in sorted(program.cycle_lines):
+            selection = QTextEdit.ExtraSelection()
+            selection.cursor = QTextCursor(self.editor.document().findBlockByLineNumber(line))
+            selection.format = QTextCharFormat()
+            selection.format.setForeground(color)
+            selections.append(selection)
+        return selections
+
+    def _apply_selections(self) -> None:
+        selections = list(self._cycle_selections)
+        if self._current_line_selection is not None:
+            selections.append(self._current_line_selection)
+        self.editor.setExtraSelections(selections)
 
     def _highlight_line(self, line_index: int) -> None:
         block = self.editor.document().findBlockByLineNumber(line_index)
@@ -222,11 +302,12 @@ class MainWindow(QMainWindow):
         selection.format = QTextCharFormat()
         selection.format.setBackground(QColor("#bfe0f5") if self.theme == "light" else QColor("#214a61"))
         selection.format.setProperty(QTextFormat.Property.FullWidthSelection, True)
-        self.editor.setExtraSelections([selection])
+        self._current_line_selection = selection
+        self._apply_selections()
         self.editor.setTextCursor(cursor)
         self.editor.centerCursor()
-        motion = self.engine.current_motion
-        if motion:
+        seg = self.engine.current_seg
+        if seg:
             for row in range(self.motion_table.rowCount()):
                 item = self.motion_table.item(row, 0)
                 if item and item.text() == str(line_index + 1):
@@ -235,10 +316,26 @@ class MainWindow(QMainWindow):
                     break
 
     def _update_readout(self) -> None:
-        motion = self.engine.current_motion
-        feed = motion.feed if motion else 0.0
-        spindle = motion.spindle if motion else 0.0
-        self.readout.setText(f"X {self.engine.tool_x:8.3f}  Z {self.engine.tool_z:8.3f}  F {feed:6.3f}  S {spindle:5.0f}")
+        seg = self.engine.current_seg
+        program = self.engine.program
+        feed = seg.feed if seg else 0.0
+        mode = _mode_label(seg.g) if seg else "--"
+        if seg:
+            tool = seg.tool
+            rpm = spindle_rpm(self.engine.tool_x, seg.css, seg.clamp, seg.sval)
+        elif program and program.segs:
+            tool = program.segs[-1].tool
+            rpm = 0.0
+        else:
+            tool = "T00"
+            rpm = 0.0
+        self.dro["X"].setText(f"{self.engine.tool_x:.3f}")
+        self.dro["Z"].setText(f"{self.engine.tool_z:.3f}")
+        self.dro["F"].setText(f"{feed:.3f}")
+        self.dro["S"].setText(f"{rpm:.0f}")
+        self.dro["G"].setText(mode)
+        self.dro["T"].setText(tool)
+        self.dro["R"].setText(f"{self.engine.removed_fraction() * 100:.0f}%")
 
     def _go_to_alarm(self, row: int, _column: int) -> None:
         item = self.alarm_table.item(row, 0)

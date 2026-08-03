@@ -7,7 +7,15 @@ from PyQt6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPainterPath, 
 from PyQt6.QtWidgets import QWidget
 
 from .dimensioning import ChamferDim, DiameterDim, LengthDim, RadiusDim, extract_dimensions
+from .lathe_core import Stock
 from .simulation import SimulationEngine
+
+TOOL_STYLES: dict[int, str] = {3: "drill", 4: "boring", 5: "grooving"}
+
+
+def _tool_station(tool: str) -> int:
+    digits = "".join(ch for ch in tool if ch.isdigit())
+    return int(digits) if digits else 0
 
 THEMES: dict[str, dict[str, QColor]] = {
     "dark": {
@@ -19,16 +27,12 @@ THEMES: dict[str, dict[str, QColor]] = {
         "raw_dark": QColor("#1c4f66"),
         "cut_light": QColor("#f0bd5b"),
         "cut_dark": QColor("#8a5a1c"),
-        "chuck_light": QColor("#9aa9b8"),
-        "chuck_dark": QColor("#40505f"),
-        "jaw_light": QColor("#b7c3cf"),
-        "jaw_dark": QColor("#586878"),
-        "chuck_outline": QColor("#c7d3de"),
-        "jaw_outline": QColor("#d6dfe7"),
         "toolpath": QColor(76, 188, 255, 125),
         "tool_outline": QColor("#e6f2ff"),
         "tool_light": QColor("#f27b7b"),
         "tool_dark": QColor("#8f2020"),
+        "tool_body_light": QColor("#aab8c4"),
+        "tool_body_dark": QColor("#4c5966"),
         "readout_text": QColor("#dbe8f5"),
         "part_light": QColor("#c3d3de"),
         "part_dark": QColor("#5c707f"),
@@ -39,6 +43,7 @@ THEMES: dict[str, dict[str, QColor]] = {
         "dim_line": QColor("#dce9f4"),
         "radius_leader": QColor("#ffce7a"),
         "chamfer_leader": QColor("#8fe0ff"),
+        "origin": QColor("#ff5c5c"),
     },
     "light": {
         "background": QColor("#eef2f6"),
@@ -49,16 +54,12 @@ THEMES: dict[str, dict[str, QColor]] = {
         "raw_dark": QColor("#2a6e8c"),
         "cut_light": QColor("#f2c877"),
         "cut_dark": QColor("#a06e1f"),
-        "chuck_light": QColor("#c3ccd4"),
-        "chuck_dark": QColor("#7c8b99"),
-        "jaw_light": QColor("#d3dae0"),
-        "jaw_dark": QColor("#93a1ae"),
-        "chuck_outline": QColor("#4f5d6b"),
-        "jaw_outline": QColor("#4f5d6b"),
         "toolpath": QColor(30, 110, 170, 140),
         "tool_outline": QColor("#5b1414"),
         "tool_light": QColor("#f28a8a"),
         "tool_dark": QColor("#941f1f"),
+        "tool_body_light": QColor("#c7d0d8"),
+        "tool_body_dark": QColor("#8a97a3"),
         "readout_text": QColor("#1f2933"),
         "part_light": QColor("#f4f7fa"),
         "part_dark": QColor("#9fb0bd"),
@@ -69,6 +70,7 @@ THEMES: dict[str, dict[str, QColor]] = {
         "dim_line": QColor("#1f2933"),
         "radius_leader": QColor("#a35d0a"),
         "chamfer_leader": QColor("#0e7490"),
+        "origin": QColor("#c0392b"),
     },
 }
 
@@ -116,8 +118,12 @@ class LatheCanvas(QWidget):
         height = max(1.0, self.height() - margin * 2)
         z_min, z_max = -program.stock_length - 8.0, 12.0
         r_max = program.stock_diameter / 2.0 + 14.0
-        px = margin + (z - z_min) / (z_max - z_min) * width
-        py = self.height() / 2.0 - x_radius / r_max * (height / 2.0)
+        # One shared scale for both axes so the part isn't stretched out of proportion.
+        scale = min(width / (z_max - z_min), height / (2.0 * r_max))
+        center_x = margin + width / 2.0
+        center_y = self.height() / 2.0
+        px = center_x + (z - (z_min + z_max) / 2.0) * scale
+        py = center_y - x_radius * scale
         return QPointF(px, py)
 
     def _draw_grid(self, painter: QPainter, colors: dict[str, QColor]) -> None:
@@ -139,19 +145,24 @@ class LatheCanvas(QWidget):
         gradient.setColorAt(1.0, dark)
         return gradient
 
-    def _stock_path(self, profile: list[float] | None = None) -> QPainterPath:
-        return self._segment_path(self.engine.stock_profile if profile is None else profile, 0, None)
+    def _stride_for(self, stock: Stock) -> int:
+        return max(1, stock.n // 800)
 
-    def _segment_path(self, profile: list[float], start: int, end: int | None) -> QPainterPath:
+    def _stock_path(self, stock: Stock | None = None) -> QPainterPath:
+        st = stock if stock is not None else self.engine.live_stock
+        if st is None:
+            return QPainterPath()
+        return self._segment_path(st, 0, st.n - 1, self._stride_for(st))
+
+    def _segment_path(self, stock: Stock, start: int, end: int, stride: int) -> QPainterPath:
         path = QPainterPath()
-        last = len(profile) - 1 if end is None else end
         points_top: list[QPointF] = []
         points_bottom: list[QPointF] = []
-        for i in range(start, last + 1):
-            z = -i * self.engine.profile_step
-            diameter = profile[i]
-            points_top.append(self._transform(z, diameter / 2.0))
-            points_bottom.append(self._transform(z, -diameter / 2.0))
+        for i in range(start, end + 1, stride):
+            z = stock.z_at(i)
+            r = stock.rad[i]
+            points_top.append(self._transform(z, r))
+            points_bottom.append(self._transform(z, -r))
         if not points_top:
             return path
         path.moveTo(points_top[0])
@@ -162,20 +173,37 @@ class LatheCanvas(QWidget):
         path.closeSubpath()
         return path
 
-    def _profile_runs(self, profile: list[float], stock_diameter: float) -> list[tuple[int, int, bool]]:
-        if not profile:
+    def _profile_runs(self, stock: Stock, stride: int) -> list[tuple[int, int, bool]]:
+        indices = [i for i in range(0, stock.n, stride) if stock.rad[i] > 0]
+        if not indices:
             return []
         runs: list[tuple[int, int, bool]] = []
-        start = 0
-        current_cut = profile[0] < stock_diameter - 0.05
-        for i in range(1, len(profile)):
-            is_cut = profile[i] < stock_diameter - 0.05
-            if is_cut != current_cut:
-                runs.append((start, i, current_cut))
+        start = prev = indices[0]
+        current_cut = bool(stock.cut[start])
+        for i in indices[1:]:
+            is_cut = bool(stock.cut[i])
+            if is_cut != current_cut or i - prev > stride:
+                runs.append((start, prev, current_cut))
                 start = i
                 current_cut = is_cut
-        runs.append((start, len(profile) - 1, current_cut))
+            prev = i
+        runs.append((start, prev, current_cut))
         return runs
+
+    def _draw_origin(self, painter: QPainter, colors: dict[str, QColor]) -> None:
+        point = self._transform(0, 0)
+        color = colors["origin"]
+        radius = 9.0
+
+        rect = QRectF(point.x() - radius, point.y() - radius, radius * 2, radius * 2)
+        painter.setPen(QPen(color, 1.4))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(rect)
+        painter.setBrush(color)
+        painter.drawPie(rect, 0, 90 * 16)
+        painter.drawPie(rect, 180 * 16, 90 * 16)
+        painter.drawLine(QPointF(point.x() - radius, point.y()), QPointF(point.x() + radius, point.y()))
+        painter.drawLine(QPointF(point.x(), point.y() - radius), QPointF(point.x(), point.y() + radius))
 
     def _draw_machine(self, painter: QPainter, colors: dict[str, QColor]) -> None:
         program = self.engine.program
@@ -184,52 +212,88 @@ class LatheCanvas(QWidget):
         painter.setPen(QPen(colors["centerline"], 1, Qt.PenStyle.DashLine))
         painter.drawLine(25, int(center_y), self.width() - 25, int(center_y))
 
-        for start, end, is_cut in self._profile_runs(self.engine.stock_profile, program.stock_diameter):
-            segment = self._segment_path(self.engine.stock_profile, start, end)
-            if segment.isEmpty():
-                continue
-            light, dark = (
-                (colors["cut_light"], colors["cut_dark"]) if is_cut else (colors["raw_light"], colors["raw_dark"])
-            )
-            painter.fillPath(segment, self._cylinder_gradient(segment.boundingRect(), light, dark))
-            painter.setPen(QPen(light.lighter(130), 1.4))
-            painter.drawPath(segment)
-
-        # Chuck jaws at positive Z.
-        chuck_x = self._transform(5, 0).x()
-        chuck_rect = QRectF(chuck_x, center_y - 75, 35, 150)
-        painter.fillRect(chuck_rect, self._cylinder_gradient(chuck_rect, colors["chuck_light"], colors["chuck_dark"]))
-        painter.setPen(QPen(colors["chuck_outline"], 1))
-        painter.drawRect(chuck_rect)
-        for jaw_y in (center_y - 68, center_y + 43):
-            jaw_rect = QRectF(chuck_x - 20, jaw_y, 25, 25)
-            painter.fillRect(jaw_rect, self._cylinder_gradient(jaw_rect, colors["jaw_light"], colors["jaw_dark"]))
-            painter.setPen(QPen(colors["jaw_outline"], 1))
-            painter.drawRect(jaw_rect)
+        live_stock = self.engine.live_stock
+        if live_stock is not None:
+            stride = self._stride_for(live_stock)
+            for start, end, is_cut in self._profile_runs(live_stock, stride):
+                segment = self._segment_path(live_stock, start, end, stride)
+                if segment.isEmpty():
+                    continue
+                light, dark = (
+                    (colors["cut_light"], colors["cut_dark"]) if is_cut else (colors["raw_light"], colors["raw_dark"])
+                )
+                painter.fillPath(segment, self._cylinder_gradient(segment.boundingRect(), light, dark))
+                painter.setPen(QPen(light.lighter(130), 1.4))
+                painter.drawPath(segment)
 
         # Programmed toolpath.
-        if program.motions:
+        if program.segs:
             painter.setPen(QPen(colors["toolpath"], 1.5, Qt.PenStyle.DashLine))
-            for motion in program.motions:
-                a = self._transform(motion.start_z, motion.start_x / 2.0)
-                b = self._transform(motion.end_z, motion.end_x / 2.0)
+            for seg in program.segs:
+                a = self._transform(seg.z0, seg.r0)
+                b = self._transform(seg.z1, seg.r1)
                 painter.drawLine(a, b)
 
         # Tool is shown above the stock; X is diameter programmed.
         tip = self._transform(self.engine.tool_z, self.engine.tool_x / 2.0)
-        tool = QPolygonF([tip, tip + QPointF(22, -10), tip + QPointF(32, -32), tip + QPointF(8, -24)])
-        tool_rect = QRectF(tip.x(), tip.y() - 32, 32, 32)
-        painter.setPen(QPen(colors["tool_outline"], 2))
-        painter.setBrush(self._cylinder_gradient(tool_rect, colors["tool_light"], colors["tool_dark"]))
-        painter.drawPolygon(tool)
+        station = _tool_station(self._active_tool())
+        self._draw_tool_icon(painter, colors, tip, TOOL_STYLES.get(station, "turning"))
         painter.setPen(colors["readout_text"])
         painter.setFont(QFont("Consolas", 9))
         painter.drawText(16, 24, f"X {self.engine.tool_x:8.3f}   Z {self.engine.tool_z:8.3f}")
 
+        self._draw_origin(painter, colors)
+
+    def _active_tool(self) -> str:
+        seg = self.engine.current_seg
+        if seg:
+            return seg.tool
+        program = self.engine.program
+        if program and program.segs:
+            return program.segs[-1].tool
+        return "T00"
+
+    def _draw_tool_icon(self, painter: QPainter, colors: dict[str, QColor], tip: QPointF, style: str) -> None:
+        body = self._cylinder_gradient(
+            QRectF(tip.x() - 10, tip.y() - 34, 20, 34), colors["tool_body_light"], colors["tool_body_dark"]
+        )
+        insert = self._cylinder_gradient(
+            QRectF(tip.x() - 8, tip.y() - 10, 16, 10), colors["tool_light"], colors["tool_dark"]
+        )
+        painter.setPen(QPen(colors["tool_outline"], 1.6))
+
+        if style == "drill":
+            shank = QRectF(tip.x() - 6, tip.y() - 34, 12, 26)
+            painter.setBrush(body)
+            painter.drawRect(shank)
+            painter.setBrush(insert)
+            painter.drawPolygon(QPolygonF([tip, tip + QPointF(-6, -8), tip + QPointF(6, -8)]))
+        elif style == "boring":
+            bar = QRectF(tip.x(), tip.y() - 5, 34, 10)
+            painter.setBrush(body)
+            painter.drawRect(bar)
+            painter.setBrush(insert)
+            painter.drawPolygon(QPolygonF([tip, tip + QPointF(8, -7), tip + QPointF(14, 0), tip + QPointF(8, 7)]))
+        elif style == "grooving":
+            blade = QRectF(tip.x() - 4, tip.y() - 30, 8, 24)
+            painter.setBrush(body)
+            painter.drawRect(blade)
+            painter.setBrush(insert)
+            painter.drawRect(QRectF(tip.x() - 5, tip.y() - 6, 10, 6))
+        else:
+            tool_rect = QRectF(tip.x(), tip.y() - 32, 32, 32)
+            painter.setPen(QPen(colors["tool_outline"], 2))
+            painter.setBrush(self._cylinder_gradient(tool_rect, colors["tool_light"], colors["tool_dark"]))
+            painter.drawPolygon(QPolygonF([tip, tip + QPointF(22, -10), tip + QPointF(32, -32), tip + QPointF(8, -24)]))
+            return
+
+        painter.setBrush(colors["tool_light"])
+        painter.drawEllipse(tip, 2.5, 2.5)
+
     def _draw_drawing(self, painter: QPainter, colors: dict[str, QColor]) -> None:
         program = self.engine.program
         assert program
-        stock = self._stock_path(self.engine.final_profile)
+        stock = self._stock_path(self.engine.final_stock)
         part_rect = stock.boundingRect()
         painter.setBrush(self._cylinder_gradient(part_rect, colors["part_light"], colors["part_dark"]))
         painter.setPen(QPen(colors["part_outline"], 1.6))
@@ -248,6 +312,7 @@ class LatheCanvas(QWidget):
         self._draw_length_dims(painter, colors, dims.lengths, part_rect)
         self._draw_radius_dims(painter, colors, dims.radii)
         self._draw_chamfer_dims(painter, colors, dims.chamfers)
+        self._draw_origin(painter, colors)
 
     def _draw_diameter_dims(
         self, painter: QPainter, colors: dict[str, QColor], diameters: list[DiameterDim], part_rect: QRectF

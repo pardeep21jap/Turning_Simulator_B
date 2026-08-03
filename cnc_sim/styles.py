@@ -20,6 +20,9 @@ QTabBar::tab:selected { background: #264158; color: #77d3ff; }
 QLabel#statusReadout { background: #0a1118; border: 1px solid #2c4050; border-radius: 4px; padding: 6px; font-family: Consolas; color: #8ee6b8; }
 QStatusBar { background: #17212c; color: #9db0bf; }
 QSplitter::handle { background: #2b3d4c; width: 3px; }
+QFrame#droRow { background: #0a1118; border: 1px solid #2c4050; border-radius: 4px; }
+QLabel#droCaption { color: #7d8b99; font-size: 8pt; }
+QLabel#droValue { color: #ffb02e; font-family: Consolas; font-size: 13pt; font-weight: 600; }
 """
 
 LIGHT_STYLESHEET = """
@@ -42,6 +45,9 @@ QTabBar::tab:selected { background: #ffffff; color: #0f6fa3; }
 QLabel#statusReadout { background: #ffffff; border: 1px solid #c9d3dc; border-radius: 4px; padding: 6px; font-family: Consolas; color: #157a54; }
 QStatusBar { background: #ffffff; color: #4b5b68; }
 QSplitter::handle { background: #c9d3dc; width: 3px; }
+QFrame#droRow { background: #ffffff; border: 1px solid #c9d3dc; border-radius: 4px; }
+QLabel#droCaption { color: #5b6b7a; font-size: 8pt; }
+QLabel#droValue { color: #a9741d; font-family: Consolas; font-size: 13pt; font-weight: 600; }
 """
 
 APP_STYLESHEET = DARK_STYLESHEET

@@ -1,12 +1,14 @@
-"""Playback engine and approximate radial stock-removal model."""
+"""Playback engine driving lathe_core's compiled segments against a live Stock."""
 
 from __future__ import annotations
 
-import math
-
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
-from .models import Motion, MotionKind, Program
+from .lathe_core import Seg, Stock
+from .models import Program
+
+RAPID_MULT = 2.5          # rapids travel this much faster than feed moves
+BASE_SPEED = 14.0         # mm of tool path per second at speed 1.0
 
 
 class SimulationEngine(QObject):
@@ -20,40 +22,42 @@ class SimulationEngine(QObject):
         self.timer.setInterval(16)
         self.timer.timeout.connect(self._tick)
         self.program: Program | None = None
-        self.motion_index = 0
-        self.progress = 0.0
+        self.live_stock: Stock | None = None
+        self.final_stock: Stock | None = None
+        self.seg_i = 0
+        self.seg_t = 0.0
         self.speed = 1.0
         self.tool_x = 60.0
         self.tool_z = 5.0
-        self.stock_profile: list[float] = []
-        self.final_profile: list[float] = []
-        self.profile_step = 0.5
+        self.cur_g = 0
+        self.feed = 0.0
+        self.current_seg: Seg | None = None
 
     @property
-    def current_motion(self) -> Motion | None:
-        if self.program and 0 <= self.motion_index < len(self.program.motions):
-            return self.program.motions[self.motion_index]
-        return None
+    def segs(self) -> list[Seg]:
+        return self.program.segs if self.program else []
 
     def load(self, program: Program) -> None:
         self.pause()
         self.program = program
-        self.motion_index = 0
-        self.progress = 0.0
-        first = program.motions[0] if program.motions else None
-        self.tool_x = first.start_x if first else program.stock_diameter + 10
-        self.tool_z = first.start_z if first else 5
-        count = max(2, int(program.stock_length / self.profile_step) + 1)
-        self.stock_profile = [program.stock_diameter] * count
-        self.final_profile = [program.stock_diameter] * count
-        for finished_motion in program.motions:
-            self._apply_cut_to(self.final_profile, finished_motion, 0.0, 1.0)
+        st = program.stock
+        self.live_stock = Stock(st.diameter, st.length, st.face_z, st.step)
+        self.final_stock = Stock(st.diameter, st.length, st.face_z, st.step)
+        for s in program.segs:
+            self.final_stock.carve(s.z0, s.r0, s.z1, s.r1)
+
+        self.seg_i, self.seg_t = 0, 0.0
+        self.current_seg = None
+        self.cur_g, self.feed = 0, 0.0
+        first = program.segs[0] if program.segs else None
+        self.tool_x = first.r0 * 2.0 if first else st.diameter + 10.0
+        self.tool_z = first.z0 if first else 5.0
         self.changed.emit()
         if first:
-            self.line_changed.emit(first.line_index)
+            self.line_changed.emit(first.line)
 
     def play(self) -> None:
-        if self.current_motion:
+        if self.seg_i < len(self.segs):
             self.timer.start()
 
     def pause(self) -> None:
@@ -68,60 +72,57 @@ class SimulationEngine(QObject):
 
     def single_block(self) -> None:
         self.pause()
-        motion = self.current_motion
-        if not motion:
+        segs = self.segs
+        if self.seg_i >= len(segs):
             return
-        self._apply_cut(motion, 0.0, 1.0)
-        self.tool_x, self.tool_z = motion.end_x, motion.end_z
-        self.motion_index += 1
-        self.progress = 0.0
-        self._announce_motion()
+        line = segs[self.seg_i].line
+        guard = 0
+        while self.seg_i < len(segs) and segs[self.seg_i].line == line and guard < 5000:
+            guard += 1
+            self.advance(segs[self.seg_i].length - self.seg_t + 1e-6)
         self.changed.emit()
 
+    def advance(self, budget: float) -> None:
+        """Consume `budget` mm of tool path, cutting as we go."""
+        segs = self.segs
+        stock = self.live_stock
+        while budget > 0 and self.seg_i < len(segs):
+            s = segs[self.seg_i]
+            mult = RAPID_MULT if s.rapid else 1.0
+            length = s.length
+            take = min(length - self.seg_t, budget * mult)
+            t0, t1 = self.seg_t, min(length, self.seg_t + take)
+
+            def at(u: float) -> tuple[float, float]:
+                f = (u / length) if length else 1.0
+                return s.z0 + (s.z1 - s.z0) * f, s.r0 + (s.r1 - s.r0) * f
+
+            az, ar = at(t0)
+            bz, br = at(t1)
+            if stock is not None:
+                stock.carve(az, ar, bz, br)
+
+            self.tool_z, self.tool_x = bz, br * 2.0
+            self.cur_g, self.feed, self.current_seg = s.g, s.feed, s
+            self.line_changed.emit(s.line)
+
+            budget -= take / mult
+            self.seg_t = t1
+            if self.seg_t >= length - 1e-9:
+                self.seg_i += 1
+                self.seg_t = 0.0
+
+        if self.seg_i >= len(segs) and self.timer.isActive():
+            self.pause()
+            self.finished.emit()
+
     def _tick(self) -> None:
-        motion = self.current_motion
-        if not motion:
+        if self.seg_i >= len(self.segs):
             self.pause()
             self.finished.emit()
             return
-        distance = math.hypot(motion.end_z - motion.start_z, (motion.end_x - motion.start_x) / 2.0)
-        increment = self.speed * 0.9 / max(distance, 1.0)
-        old_progress = self.progress
-        self.progress = min(1.0, self.progress + increment)
-        eased = self.progress
-        self.tool_x = motion.start_x + (motion.end_x - motion.start_x) * eased
-        self.tool_z = motion.start_z + (motion.end_z - motion.start_z) * eased
-        self._apply_cut(motion, old_progress, self.progress)
-        if self.progress >= 1.0:
-            self.motion_index += 1
-            self.progress = 0.0
-            self._announce_motion()
+        self.advance(0.033 * BASE_SPEED * self.speed)
         self.changed.emit()
 
-    def _announce_motion(self) -> None:
-        motion = self.current_motion
-        if motion:
-            self.line_changed.emit(motion.line_index)
-
-    def _apply_cut(self, motion: Motion, p0: float, p1: float) -> None:
-        if not self.program:
-            return
-        self._apply_cut_to(self.stock_profile, motion, p0, p1)
-
-    def _apply_cut_to(self, profile: list[float], motion: Motion, p0: float, p1: float) -> None:
-        if not motion.is_cutting:
-            return
-        span = max(abs(motion.end_z - motion.start_z), abs(motion.end_x - motion.start_x), 0.5)
-        samples = max(2, int(span / self.profile_step) + 2)
-        for i in range(samples + 1):
-            p = p0 + (p1 - p0) * i / samples
-            z = motion.start_z + (motion.end_z - motion.start_z) * p
-            x = motion.start_x + (motion.end_x - motion.start_x) * p
-            index = int(round(-z / self.profile_step))
-            if 0 <= index < len(profile):
-                profile[index] = min(profile[index], max(0.0, x))
-                if motion.kind in (MotionKind.CUT, MotionKind.THREAD):
-                    for neighbor in (-1, 1):
-                        ni = index + neighbor
-                        if 0 <= ni < len(profile):
-                            profile[ni] = min(profile[ni], max(0.0, x + 0.2))
+    def removed_fraction(self) -> float:
+        return self.live_stock.removed_fraction() if self.live_stock else 0.0
